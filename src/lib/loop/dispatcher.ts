@@ -1,6 +1,7 @@
 import type { Subprocess } from "bun";
 import { getAdapter } from "../adapters/index.js";
 import { createAgent as dbCreateAgent, updateAgent } from "../../db/index.js";
+import { generateMcpConfig, cleanupMcpConfig } from "../mcp-config.js";
 import type { AgentAdapterConfig, AgentBackend, AgentEvent, AgentProcess, AgentRow } from "../../types/index.js";
 import type { PlanTask } from "./planner.js";
 
@@ -44,6 +45,9 @@ export function spawnAgent(
   const adapter = getAdapter(config.backend);
   const agentId = `${swarmId}-${agentName}`;
 
+  // Generate MCP config so the agent has access to todos, mementos, conversations, etc.
+  const mcpConfigPath = config.mcpConfigPath || generateMcpConfig(agentId);
+
   const adapterConfig: AgentAdapterConfig = {
     backend: config.backend,
     command: task.description,
@@ -51,8 +55,8 @@ export function spawnAgent(
     workdir: config.workdir,
     maxBudgetUsd: config.maxBudgetUsd,
     maxTurns: config.maxTurns,
-    systemPrompt: config.systemPrompt || `You are a ${task.role} agent. Your task: ${task.title}. Details: ${task.description}`,
-    mcpConfigPath: config.mcpConfigPath,
+    systemPrompt: config.systemPrompt || `You are a ${task.role} agent in an autonomous swarm (id: ${swarmId}). Your name is ${agentName}.\n\nYour task: ${task.title}\nDetails: ${task.description}\n\nRules:\n- Register with conversations MCP as '${agentName}' and post status updates to the '${swarmId}' space\n- Save learnings to mementos MCP under project 'open-swarm'\n- Update your task status in todos MCP when starting and completing work\n- Stay within your budget allocation`,
+    mcpConfigPath,
   };
 
   const { proc, process: agentProcess } = adapter.spawn(adapterConfig, agentId, agentName);
@@ -82,4 +86,5 @@ export function killAgent(running: RunningAgent): void {
   const adapter = getAdapter(running.agent.backend);
   adapter.kill(running.proc);
   updateAgent(running.agent.id, { status: "killed" });
+  cleanupMcpConfig(running.agent.id);
 }

@@ -1,6 +1,7 @@
 import type { RunningAgent } from "./dispatcher.js";
 import type { AgentEvent, AgentResult, BudgetState, SwarmEvent, SwarmEventHandler } from "../../types/index.js";
 import { updateAgent } from "../../db/index.js";
+import { appendEvent } from "../stream-store.js";
 
 export interface MonitorResult {
   results: AgentResult[];
@@ -32,6 +33,10 @@ export async function monitorAgents(
         // Update heartbeat
         running.agent.lastHeartbeat = Date.now();
         updateAgent(running.agent.id, { last_heartbeat: Date.now() });
+
+        // Persist event to stream store for attach/detach
+        const swarmPart = running.agent.id.split("-")[0] || "";
+        appendEvent(swarmPart, running.agent.name, { type: event.type, ...event.data });
 
         // Collect output
         if (event.type === "delta" && event.data.text) {

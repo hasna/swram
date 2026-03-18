@@ -4,6 +4,11 @@ import { createLoopContext, advancePhase, updateBudget, isBudgetExhausted, allTa
 import { planFromGoal, type PlanResult } from "./planner.js";
 import { spawnAgent, pickAgentName, killAgent, type RunningAgent } from "./dispatcher.js";
 import { monitorAgents } from "./monitor.js";
+import { cleanupAllMcpConfigs } from "../mcp-config.js";
+import { createTodoTasks, updateTodoTask, startTodoTask } from "../integrations/todos.js";
+import { createSwarmSpace, sendToSpace, postSwarmSummary } from "../integrations/conversations.js";
+import { recallProjectMemories, saveSwarmMemory } from "../integrations/mementos.js";
+import { shouldWarnBudget } from "../integrations/economy.js";
 import type { SwarmConfig, Swarm, SwarmEvent, SwarmEventHandler, AgentBackend, LoopPhase } from "../../types/index.js";
 
 export interface EngineOptions {
@@ -50,21 +55,28 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
   try {
     // === GOAL PHASE ===
     setPhase("goal");
-    // Goal is already in config, no action needed
+
+    // Create a conversations space for this swarm
+    await createSwarmSpace(swarmId, config.goal);
+    await sendToSpace(swarmId, `Swarm started. Goal: ${config.goal}`, "orchestrator");
 
     // === PLAN PHASE ===
     setPhase("plan");
+
+    // Recall relevant memories from past runs
+    const memories = await recallProjectMemories("open-swarm");
+    ctx.memories = memories;
+
     const plan: PlanResult = planFromGoal(ctx);
     ctx.plan = plan.reasoning;
 
+    await sendToSpace(swarmId, `Plan: ${plan.reasoning} (${plan.tasks.length} tasks, topology: ${plan.topology})`, "orchestrator");
+
     // === DECOMPOSE PHASE ===
     setPhase("decompose");
-    ctx.tasks = plan.tasks.map((t, i) => ({
-      id: `${swarmId}-task-${i}`,
-      title: t.title,
-      status: "pending",
-      dependsOn: t.dependsOn,
-    }));
+
+    // Create real tasks in todos MCP
+    ctx.tasks = await createTodoTasks(swarmId, plan.tasks);
     emit("task:created", { count: ctx.tasks.length });
 
     // === MAIN LOOP ===
@@ -73,9 +85,16 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
       ctx.iteration = iteration;
       updateSwarm(swarmId, { iterations: iteration + 1 });
 
+      // Budget checks
       if (isBudgetExhausted(ctx)) {
         emit("budget:exceeded", { ...ctx.budget });
+        await sendToSpace(swarmId, "Budget exceeded. Stopping swarm.", "orchestrator");
         break;
+      }
+
+      if (shouldWarnBudget(ctx.budget.spentUsd, ctx.budget.maxUsd)) {
+        emit("budget:warning", { ...ctx.budget });
+        await sendToSpace(swarmId, `Budget warning: $${ctx.budget.spentUsd.toFixed(2)}/$${ctx.budget.maxUsd} (${((ctx.budget.spentUsd / ctx.budget.maxUsd) * 100).toFixed(0)}%)`, "orchestrator");
       }
 
       if (allTasksComplete(ctx)) break;
@@ -85,7 +104,6 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
       const pendingTasks = plan.tasks.filter((_, i) => {
         const ref = ctx.tasks[i];
         if (!ref || ref.status !== "pending") return false;
-        // Check dependencies
         if (ref.dependsOn) {
           return ref.dependsOn.every(dep => {
             const depTask = ctx.tasks.find(t => t.title === dep);
@@ -96,15 +114,10 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
       });
 
       if (pendingTasks.length === 0 && !allTasksComplete(ctx)) {
-        // No tasks ready, but not all complete — wait for deps
-        // This shouldn't happen in a well-formed DAG, but guard anyway
         break;
       }
 
-      // Determine default backend
       const defaultBackend: AgentBackend = config.agents[0]?.backend || "claude";
-
-      // Spawn agents for ready tasks (up to maxAgents)
       const running: RunningAgent[] = [];
       const maxConcurrent = Math.min(pendingTasks.length, config.maxAgents);
 
@@ -119,18 +132,20 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
           workdir: config.workdir,
           maxBudgetUsd: config.maxBudgetUsd / Math.max(plan.tasks.length, 1),
           systemPrompt: config.systemPrompt,
-          mcpConfigPath: undefined,
         });
 
         running.push(agent);
         emit("agent:spawned", { name, backend, task: task.title });
 
-        // Mark task as assigned
+        // Update task status in todos + context
         const taskRef = ctx.tasks.find(t => t.title === task.title);
         if (taskRef) {
           taskRef.status = "in_progress";
           taskRef.assignedTo = name;
+          await startTodoTask(taskRef.id);
         }
+
+        await sendToSpace(swarmId, `Agent ${name} (${backend}) assigned: ${task.title}`, "orchestrator");
       }
 
       // === MONITOR PHASE ===
@@ -142,11 +157,13 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
       ctx.results.push(...monitorResult.results);
       updateBudget(ctx, monitorResult.totalCost, Date.now() - startTime);
 
-      // Update task statuses based on results
+      // Update task statuses in todos + context
       for (const result of monitorResult.results) {
         const taskRef = ctx.tasks.find(t => t.title === result.taskId);
         if (taskRef) {
-          taskRef.status = result.status === "success" ? "completed" : "failed";
+          const newStatus = result.status === "success" ? "completed" : "failed";
+          taskRef.status = newStatus;
+          await updateTodoTask(taskRef.id, newStatus);
           emit(result.status === "success" ? "task:completed" : "task:failed", { task: taskRef.title, agent: result.agentName });
         }
       }
@@ -159,9 +176,11 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
       // === REFLECT PHASE ===
       setPhase("reflect");
       const failures = monitorResult.results.filter(r => r.status === "failure");
-      if (failures.length > 0) {
-        // For now, log failures. Future: retry or replan
-        emit("loop:iteration", { iteration, failures: failures.length, successes: monitorResult.results.length - failures.length });
+      const successes = monitorResult.results.filter(r => r.status === "success");
+
+      if (failures.length > 0 || successes.length > 0) {
+        emit("loop:iteration", { iteration, failures: failures.length, successes: successes.length });
+        await sendToSpace(swarmId, `Iteration ${iteration + 1}: ${successes.length} succeeded, ${failures.length} failed`, "orchestrator");
       }
 
       // === REPEAT ===
@@ -172,6 +191,31 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
     const finalStatus = allTasksComplete(ctx) ? "completed" : isBudgetExhausted(ctx) ? "failed" : "completed";
     updateSwarm(swarmId, { status: finalStatus, completed_at: Date.now() });
     emit("swarm:completed", { status: finalStatus, iterations: ctx.iteration, cost: ctx.budget.spentUsd });
+
+    const tasksCompleted = ctx.tasks.filter(t => t.status === "completed").length;
+    const tasksFailed = ctx.tasks.filter(t => t.status === "failed").length;
+
+    // Save run to mementos
+    await saveSwarmMemory(swarmId, config.goal, {
+      status: finalStatus,
+      iterations: ctx.iteration + 1,
+      cost: ctx.budget.spentUsd,
+      tasksCompleted,
+      tasksFailed,
+      learnings: [],
+    });
+
+    // Post summary to conversations
+    await postSwarmSummary(swarmId, "orchestrator", {
+      status: finalStatus,
+      iterations: ctx.iteration + 1,
+      cost: ctx.budget.spentUsd,
+      tasksCompleted,
+      tasksFailed,
+    });
+
+    // Cleanup temp MCP configs
+    cleanupAllMcpConfigs();
 
     return {
       id: swarmId,
@@ -189,6 +233,9 @@ export async function runSwarm(config: SwarmConfig, options: EngineOptions = {})
     const errMsg = err instanceof Error ? err.message : String(err);
     updateSwarm(swarmId, { status: "failed", error: errMsg, completed_at: Date.now() });
     emit("swarm:failed", { error: errMsg });
+
+    await sendToSpace(swarmId, `Swarm FAILED: ${errMsg}`, "orchestrator");
+    cleanupAllMcpConfigs();
 
     return {
       id: swarmId,

@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { runSwarm } from "../lib/loop/engine.js";
 import { getSwarm, listSwarms, listAgentsBySwarm, listEvents, deleteSwarm } from "../db/index.js";
 import { listAdapters } from "../lib/adapters/index.js";
+import { readStream, tailStream, listStreams } from "../lib/stream-store.js";
 import type { SwarmConfig, AgentSlot, AgentBackend, LoopPhase } from "../types/index.js";
 
 const program = new Command()
@@ -241,7 +242,128 @@ program
     console.log(chalk.green(`  Deleted swarm ${id}`));
   });
 
+// === swarm attach ===
+program
+  .command("attach")
+  .description("Attach to a running agent's output stream")
+  .argument("<agent-name>", "Agent name to attach to (e.g. maximus)")
+  .option("-s, --swarm <id>", "Swarm ID (default: latest)")
+  .option("-f, --follow", "Follow mode: poll for new output every 500ms", false)
+  .option("--from <n>", "Start from line N (default: 0)", "0")
+  .action(async (agentName, opts) => {
+    let swarmId = opts.swarm;
+    if (!swarmId) {
+      const all = listSwarms(1);
+      swarmId = all[0]?.id;
+    }
+    if (!swarmId) {
+      console.log(chalk.red("No swarm found."));
+      process.exit(1);
+    }
+
+    // Check if agent exists in this swarm
+    const agents = listAgentsBySwarm(swarmId);
+    const agent = agents.find(a => a.name === agentName);
+    if (!agent) {
+      const available = agents.map(a => a.name).join(", ");
+      console.log(chalk.red(`Agent "${agentName}" not found in swarm ${swarmId}.`));
+      if (available) console.log(chalk.dim(`  Available: ${available}`));
+      process.exit(1);
+    }
+
+    console.log(chalk.cyan(`  Attached to ${agentName} (${agent.backend}) — ${agent.status}`));
+    console.log(chalk.dim(`  Ctrl+C to detach\n`));
+
+    // Print existing output
+    const fromLine = parseInt(opts.from);
+    const lines = readStream(swarmId, agentName, fromLine);
+    for (const line of lines) {
+      printStreamLine(line);
+    }
+
+    if (opts.follow) {
+      // Follow mode: poll for new lines
+      const interval = setInterval(() => {
+        const newLines = tailStream(swarmId, agentName);
+        for (const line of newLines) {
+          printStreamLine(line);
+        }
+
+        // Check if agent is done
+        const freshAgent = listAgentsBySwarm(swarmId).find(a => a.name === agentName);
+        if (freshAgent && (freshAgent.status === "completed" || freshAgent.status === "failed" || freshAgent.status === "killed")) {
+          console.log(chalk.dim(`\n  Agent ${agentName} ${freshAgent.status}. Detaching.`));
+          clearInterval(interval);
+        }
+      }, 500);
+
+      // Handle Ctrl+C
+      process.on("SIGINT", () => {
+        clearInterval(interval);
+        console.log(chalk.dim("\n  Detached."));
+        process.exit(0);
+      });
+
+      // Keep alive
+      await new Promise(() => {});
+    }
+  });
+
+// === swarm streams ===
+program
+  .command("streams")
+  .description("List available agent streams for a swarm")
+  .argument("[swarm-id]", "Swarm ID (default: latest)")
+  .action((swarmId) => {
+    if (!swarmId) {
+      const all = listSwarms(1);
+      swarmId = all[0]?.id;
+    }
+    if (!swarmId) {
+      console.log(chalk.red("No swarm found."));
+      process.exit(1);
+    }
+
+    const streams = listStreams(swarmId);
+    if (streams.length === 0) {
+      console.log(chalk.dim("  No streams found."));
+      return;
+    }
+
+    const agents = listAgentsBySwarm(swarmId);
+    console.log();
+    for (const name of streams) {
+      const agent = agents.find(a => a.name === name);
+      const status = agent ? chalk.dim(`(${agent.backend}, ${agent.status})`) : "";
+      console.log(`  ${chalk.bold(name)} ${status}`);
+    }
+    console.log(chalk.dim(`\n  Use: swarm attach <name> -f  to follow output`));
+    console.log();
+  });
+
 // === Helpers ===
+
+function printStreamLine(line: string): void {
+  try {
+    const event = JSON.parse(line);
+    const type = event.type || "unknown";
+    if (type === "delta" && event.text) {
+      process.stdout.write(event.text);
+    } else if (type === "tool_call") {
+      console.log(chalk.yellow(`  [tool] ${event.tool || event.command || JSON.stringify(event).slice(0, 100)}`));
+    } else if (type === "tool_result") {
+      console.log(chalk.dim(`  [result] ${JSON.stringify(event).slice(0, 120)}`));
+    } else if (type === "error") {
+      console.log(chalk.red(`  [error] ${event.text || JSON.stringify(event)}`));
+    } else if (type === "done") {
+      console.log(chalk.green(`\n  [done] cost: ${event.cost || 0} tokens: ${event.tokens || 0}`));
+    } else {
+      console.log(chalk.dim(`  [${type}] ${JSON.stringify(event).slice(0, 100)}`));
+    }
+  } catch {
+    console.log(line);
+  }
+}
 
 function parseAgentSpec(spec: string): AgentSlot[] {
   return spec.split(",").map((s) => {
