@@ -27,6 +27,7 @@ export class ClaudeAdapter extends BaseAdapter {
 
     // Allow all tools for autonomous operation
     cmd.push("--allowedTools", "*");
+    cmd.push("--permission-mode", "bypassPermissions");
 
     return { cmd };
   }

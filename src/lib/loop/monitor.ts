@@ -54,10 +54,10 @@ export async function monitorAgents(
         // Forward event
         if (onEvent) {
           await onEvent({
-            type: "agent:spawned",
+            type: `agent:${event.type === "done" ? "completed" : "spawned"}` as any,
             timestamp: Date.now(),
             swarmId: running.agent.id.split("-")[0] || "",
-            data: { agentId: running.agent.id, event },
+            data: { agentId: running.agent.id, agentName: running.agent.name, backend: running.agent.backend, eventType: event.type, ...event.data },
           });
         }
 

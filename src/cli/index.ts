@@ -58,7 +58,7 @@ program
       onEvent: async (event) => {
         if (opts.json) {
           console.log(JSON.stringify(event));
-        } else if (event.type === "agent:spawned") {
+        } else if (event.type === "agent:spawned" && event.data.name) {
           console.log(chalk.green(`    + agent ${event.data.name} (${event.data.backend}) -> ${event.data.task}`));
         } else if (event.type === "task:completed") {
           console.log(chalk.green(`    ✓ ${event.data.task} (${event.data.agent})`));
@@ -67,6 +67,7 @@ program
         } else if (event.type === "budget:exceeded") {
           console.log(chalk.red(`    ! Budget exceeded`));
         }
+        // Silently ignore forwarded monitor events (agent stream events)
       },
     });
 
